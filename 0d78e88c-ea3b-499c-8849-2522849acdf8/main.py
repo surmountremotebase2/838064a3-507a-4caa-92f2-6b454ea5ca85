@@ -1,88 +1,67 @@
 from surmount.base_class import Strategy, TargetAllocation
 from surmount.logging import log
 from datetime import datetime
-import math
 
 
 class TradingStrategy(Strategy):
     """
-    ATHENA Adaptive Momentum-Volume-Alpha Intraday Strategy
+    ATHENA Adaptive MVA Intraday — Reduced Data Universe
 
     Market-day playbooks:
-      1. Bull trend: momentum/EMA pullback
-      2. Bear trend: inverse ETF momentum
-      3. Range day: VWAP mean reversion
-      4. High-volatility day: reduced-risk reversal
-      5. No-trade day: remain in cash
+      BULL_TREND         -> Momentum and relative-strength entry
+      RANGE              -> VWAP mean-reversion entry
+      VOLATILITY_REVERSAL-> VWAP-reclaim entry at half risk
+      BEAR_TREND         -> Cash
+      NO_TRADE           -> Cash
 
-    This is designed for Surmount backtesting and IBKR paper testing.
+    Designed for Surmount 5-minute backtesting.
     """
 
     def __init__(self):
-        # Benchmark and market-regime instruments.
-        self.market_tickers = [
-            "SPY", "QQQ", "IWM", "DIA"
-        ]
-
-        # Sector ETFs.
-        self.etf_tickers = [
-            "SPY", "QQQ", "IWM", "DIA",
-            "XLK", "XLF", "XLE", "SMH"
-        ]
-
-        # Highly liquid equities.
-        self.stock_tickers = [
-            "NVDA", "AMD", "AAPL", "MSFT",
-            "AMZN", "META", "GOOGL", "TSLA",
-            "AVGO", "NFLX"
-        ]
-
-        # Bear-market instruments.
-        self.inverse_tickers = [
-            "SH", "PSQ", "RWM"
-        ]
+        # Reduced universe to improve Surmount data availability.
+        self.market_tickers = ["SPY", "QQQ"]
+        self.etf_tickers = ["SPY", "QQQ", "IWM", "SMH"]
+        self.stock_tickers = ["NVDA", "AMD", "AAPL", "MSFT"]
 
         self.tickers = list(dict.fromkeys(
             self.market_tickers
             + self.etf_tickers
             + self.stock_tickers
-            + self.inverse_tickers
         ))
 
         # Position state.
         self.active_symbol = None
+        self.active_allocation = 0.0
         self.entry_price = None
         self.initial_stop = None
         self.active_stop = None
-        self.profit_target = None
         self.initial_risk = None
+        self.profit_target = None
         self.highest_price = None
-        self.entry_time = None
-        self.entry_day = None
-        self.breakeven_activated = False
-        self.trailing_activated = False
-        self.below_vwap_count = 0
+        self.breakeven_active = False
+        self.trailing_active = False
+        self.below_vwap_bars = 0
 
         # Daily state.
         self.current_day = None
         self.daily_entries = 0
-        self.daily_losses = 0
+        self.consecutive_losses = 0
         self.daily_realized_r = 0.0
-        self.last_exit_bar = {}
         self.symbol_entries = {}
+        self.last_exit_bar = {}
 
-        # Risk configuration.
+        # Risk settings.
         self.normal_risk_fraction = 0.0025
         self.reversal_risk_fraction = 0.00125
         self.maximum_allocation = 0.20
         self.minimum_allocation = 0.01
 
-        # Selection configuration.
-        self.minimum_score = 70.0
-        self.minimum_relative_volume = 1.50
+        # Trading limits.
         self.maximum_daily_entries = 6
         self.maximum_symbol_entries = 2
-        self.cooldown_bars = 6  # Six 5-minute bars = 30 minutes.
+        self.cooldown_bars = 6
+        self.minimum_score = 70.0
+        self.minimum_relative_volume = 1.20
 
     @property
     def interval(self):
@@ -96,40 +75,40 @@ class TradingStrategy(Strategy):
     def data(self):
         return []
 
-    # ------------------------------------------------------------
+    # ============================================================
     # Data helpers
-    # ------------------------------------------------------------
+    # ============================================================
 
-    def _bars(self, ohlcv, symbol):
-        output = []
+    def get_bars(self, ohlcv, symbol):
+        bars = []
 
-        for bar in ohlcv:
-            if symbol not in bar:
+        for period in ohlcv:
+            if symbol not in period:
                 continue
 
-            item = bar[symbol]
+            item = period[symbol]
 
             try:
-                output.append({
+                bars.append({
                     "date": item.get("date"),
                     "open": float(item.get("open", 0)),
                     "high": float(item.get("high", 0)),
                     "low": float(item.get("low", 0)),
                     "close": float(item.get("close", 0)),
-                    "volume": float(item.get("volume", 0)),
+                    "volume": float(item.get("volume", 0))
                 })
             except Exception:
                 continue
 
-        return output
+        return bars
 
-    def _sma(self, values, length):
+    def sma(self, values, length):
         if len(values) < length:
             return None
 
         return sum(values[-length:]) / float(length)
 
-    def _ema(self, values, length):
+    def ema(self, values, length):
         if len(values) < length:
             return None
 
@@ -137,11 +116,14 @@ class TradingStrategy(Strategy):
         result = values[0]
 
         for value in values[1:]:
-            result = value * multiplier + result * (1.0 - multiplier)
+            result = (
+                value * multiplier
+                + result * (1.0 - multiplier)
+            )
 
         return result
 
-    def _returns(self, closes, bars_back):
+    def percentage_return(self, closes, bars_back):
         if len(closes) <= bars_back:
             return None
 
@@ -152,7 +134,7 @@ class TradingStrategy(Strategy):
 
         return closes[-1] / previous - 1.0
 
-    def _atr(self, bars, length=14):
+    def atr(self, bars, length=14):
         if len(bars) < length + 1:
             return None
 
@@ -174,18 +156,21 @@ class TradingStrategy(Strategy):
         if len(true_ranges) < length:
             return None
 
-        return sum(true_ranges[-length:]) / float(length)
+        return (
+            sum(true_ranges[-length:])
+            / float(length)
+        )
 
-    def _vwap(self, bars):
+    def vwap(self, bars):
         if not bars:
             return None
 
-        latest_date = str(bars[-1]["date"])[:10]
+        latest_day = str(bars[-1]["date"])[:10]
         price_volume = 0.0
         total_volume = 0.0
 
         for bar in bars:
-            if str(bar["date"])[:10] != latest_date:
+            if str(bar["date"])[:10] != latest_day:
                 continue
 
             typical_price = (
@@ -194,7 +179,10 @@ class TradingStrategy(Strategy):
                 + bar["close"]
             ) / 3.0
 
-            price_volume += typical_price * bar["volume"]
+            price_volume += (
+                typical_price * bar["volume"]
+            )
+
             total_volume += bar["volume"]
 
         if total_volume <= 0:
@@ -202,46 +190,59 @@ class TradingStrategy(Strategy):
 
         return price_volume / total_volume
 
-    def _relative_volume(self, bars):
-        if len(bars) < 21:
-            return None
-
-        historical_volumes = [
-            bar["volume"] for bar in bars[-21:-1]
-            if bar["volume"] > 0
-        ]
-
-        if len(historical_volumes) < 10:
-            return None
-
-        normal_volume = sum(historical_volumes) / len(historical_volumes)
-
-        if normal_volume <= 0:
-            return None
-
-        return bars[-1]["volume"] / normal_volume
-
-    def _swing_low(self, bars, length=5):
+    def relative_volume(self, bars, length=20):
         if len(bars) < length + 1:
             return None
 
-        # Exclude the currently forming/latest completed signal bar.
-        return min(bar["low"] for bar in bars[-length - 1:-1])
+        previous_volumes = [
+            bar["volume"]
+            for bar in bars[-length - 1:-1]
+            if bar["volume"] > 0
+        ]
 
-    def _bar_number(self, ohlcv):
-        return len(ohlcv)
+        if len(previous_volumes) < 10:
+            return None
 
-    def _timestamp(self, ohlcv):
+        average_volume = (
+            sum(previous_volumes)
+            / float(len(previous_volumes))
+        )
+
+        if average_volume <= 0:
+            return None
+
+        return bars[-1]["volume"] / average_volume
+
+    def swing_low(self, bars, length=5):
+        if len(bars) < length + 1:
+            return None
+
+        completed = bars[-length - 1:-1]
+
+        if not completed:
+            return None
+
+        return min(
+            bar["low"] for bar in completed
+        )
+
+    def current_timestamp(self, ohlcv):
         if not ohlcv:
             return None
 
-        for symbol in ["SPY", "QQQ"] + self.tickers:
-            if symbol in ohlcv[-1]:
-                return ohlcv[-1][symbol].get("date")
+        latest = ohlcv[-1]
+
+        for symbol in ["SPY", "QQQ"]:
+            if symbol in latest:
+                return latest[symbol].get("date")
+
+        for symbol in self.tickers:
+            if symbol in latest:
+                return latest[symbol].get("date")
 
         return None
 
-    def _parse_timestamp(self, value):
+    def parse_timestamp(self, value):
         if value is None:
             return None
 
@@ -258,40 +259,53 @@ class TradingStrategy(Strategy):
             except Exception:
                 return None
 
-    # ------------------------------------------------------------
-    # Indicator package for one security
-    # ------------------------------------------------------------
+    # ============================================================
+    # Symbol metrics
+    # ============================================================
 
-    def _metrics(self, ohlcv, symbol):
-        bars = self._bars(ohlcv, symbol)
+    def metrics(self, ohlcv, symbol):
+        bars = self.get_bars(ohlcv, symbol)
 
         if len(bars) < 31:
             return None
 
-        closes = [bar["close"] for bar in bars]
-        volumes = [bar["volume"] for bar in bars]
+        closes = [
+            bar["close"] for bar in bars
+        ]
 
         price = closes[-1]
-        ema9 = self._ema(closes[-30:], 9)
-        ema20 = self._ema(closes[-40:], 20)
-        atr14 = self._atr(bars, 14)
-        vwap = self._vwap(bars)
-        relative_volume = self._relative_volume(bars)
+        ema9 = self.ema(closes[-30:], 9)
+        ema20 = self.ema(closes[-40:], 20)
+        atr14 = self.atr(bars, 14)
+        session_vwap = self.vwap(bars)
+        rvol = self.relative_volume(bars, 20)
 
-        return_5 = self._returns(closes, 1)
-        return_15 = self._returns(closes, 3)
-        return_30 = self._returns(closes, 6)
+        return_5 = self.percentage_return(
+            closes, 1
+        )
+
+        return_15 = self.percentage_return(
+            closes, 3
+        )
+
+        return_30 = self.percentage_return(
+            closes, 6
+        )
+
+        required = [
+            ema9,
+            ema20,
+            atr14,
+            session_vwap,
+            rvol,
+            return_5,
+            return_15,
+            return_30
+        ]
 
         if (
             price <= 0
-            or ema9 is None
-            or ema20 is None
-            or atr14 is None
-            or vwap is None
-            or relative_volume is None
-            or return_5 is None
-            or return_15 is None
-            or return_30 is None
+            or any(value is None for value in required)
         ):
             return None
 
@@ -302,25 +316,25 @@ class TradingStrategy(Strategy):
             "open": bars[-1]["open"],
             "high": bars[-1]["high"],
             "low": bars[-1]["low"],
-            "volume": volumes[-1],
+            "volume": bars[-1]["volume"],
             "ema9": ema9,
             "ema20": ema20,
             "atr": atr14,
-            "vwap": vwap,
-            "relative_volume": relative_volume,
+            "vwap": session_vwap,
+            "relative_volume": rvol,
             "return_5": return_5,
             "return_15": return_15,
             "return_30": return_30,
-            "swing_low": self._swing_low(bars, 5),
+            "swing_low": self.swing_low(bars, 5)
         }
 
-    # ------------------------------------------------------------
+    # ============================================================
     # Market-day classification
-    # ------------------------------------------------------------
+    # ============================================================
 
-    def _classify_market_day(self, ohlcv):
-        spy = self._metrics(ohlcv, "SPY")
-        qqq = self._metrics(ohlcv, "QQQ")
+    def classify_market_day(self, ohlcv):
+        spy = self.metrics(ohlcv, "SPY")
+        qqq = self.metrics(ohlcv, "QQQ")
 
         if spy is None or qqq is None:
             return "NO_TRADE"
@@ -358,44 +372,47 @@ class TradingStrategy(Strategy):
         else:
             bear_points += 1
 
-        market_relative_volume = (
-            spy["relative_volume"] + qqq["relative_volume"]
+        market_rvol = (
+            spy["relative_volume"]
+            + qqq["relative_volume"]
         ) / 2.0
 
-        spy_atr_fraction = spy["atr"] / spy["price"]
-        qqq_atr_fraction = qqq["atr"] / qqq["price"]
-        market_volatility = (
-            spy_atr_fraction + qqq_atr_fraction
+        market_momentum = (
+            abs(spy["return_30"])
+            + abs(qqq["return_30"])
         ) / 2.0
 
-        # Excessively weak volume and no direction.
+        market_atr_fraction = (
+            spy["atr"] / spy["price"]
+            + qqq["atr"] / qqq["price"]
+        ) / 2.0
+
+        # Low-volume, low-momentum session.
         if (
-            market_relative_volume < 0.70
-            and abs(spy["return_30"]) < 0.002
-            and abs(qqq["return_30"]) < 0.002
+            market_rvol < 0.70
+            and market_momentum < 0.002
         ):
             return "NO_TRADE"
 
-        # High-volatility reversal environment.
+        # High-volatility VWAP reversal.
+        spy_reclaimed_vwap = (
+            spy["low"] < spy["vwap"]
+            and spy["price"] > spy["vwap"]
+        )
+
+        qqq_reclaimed_vwap = (
+            qqq["low"] < qqq["vwap"]
+            and qqq["price"] > qqq["vwap"]
+        )
+
         if (
-            market_volatility > 0.006
+            market_atr_fraction > 0.004
             and (
-                spy["price"] * spy["open"] > 0
-                or qqq["price"] * qqq["open"] > 0
+                spy_reclaimed_vwap
+                or qqq_reclaimed_vwap
             )
         ):
-            spy_reversal = (
-                spy["low"] < spy["vwap"]
-                and spy["price"] > spy["vwap"]
-            )
-
-            qqq_reversal = (
-                qqq["low"] < qqq["vwap"]
-                and qqq["price"] > qqq["vwap"]
-            )
-
-            if spy_reversal or qqq_reversal:
-                return "VOLATILITY_REVERSAL"
+            return "VOLATILITY_REVERSAL"
 
         if bull_points >= 5:
             return "BULL_TREND"
@@ -405,259 +422,275 @@ class TradingStrategy(Strategy):
 
         return "RANGE"
 
-    # ------------------------------------------------------------
-    # Cross-sectional ranking
-    # ------------------------------------------------------------
+    # ============================================================
+    # Ranking and stock selection
+    # ============================================================
 
-    def _percentile_scores(self, values):
+    def percentile_scores(self, values):
         if not values:
             return {}
 
-        ordered = sorted(values.items(), key=lambda item: item[1])
+        ordered = sorted(
+            values.items(),
+            key=lambda item: item[1]
+        )
+
         count = len(ordered)
-        output = {}
+        scores = {}
 
         for index, item in enumerate(ordered):
             symbol = item[0]
 
             if count == 1:
-                output[symbol] = 100.0
+                scores[symbol] = 100.0
             else:
-                output[symbol] = (
+                scores[symbol] = (
                     index / float(count - 1)
                 ) * 100.0
 
-        return output
+        return scores
 
-    def _rank_long_candidates(self, ohlcv):
-        spy = self._metrics(ohlcv, "SPY")
+    def rank_momentum_candidates(self, ohlcv):
+        spy = self.metrics(ohlcv, "SPY")
 
         if spy is None:
             return []
 
         metrics_by_symbol = {}
-        momentum_values = {}
-        volume_values = {}
-        alpha_values = {}
+        momentum_raw = {}
+        volume_raw = {}
+        alpha_raw = {}
 
-        universe = self.stock_tickers + self.etf_tickers
+        for symbol in self.tickers:
+            item = self.metrics(ohlcv, symbol)
 
-        for symbol in universe:
-            metrics = self._metrics(ohlcv, symbol)
-
-            if metrics is None:
+            if item is None:
                 continue
 
-            # Basic liquidity and eligibility filters.
-            if metrics["price"] < 5:
+            if item["price"] < 5:
                 continue
 
-            if metrics["volume"] * metrics["price"] < 500000:
+            current_dollar_volume = (
+                item["price"] * item["volume"]
+            )
+
+            if current_dollar_volume < 500000:
                 continue
 
             momentum = (
-                0.20 * metrics["return_5"]
-                + 0.35 * metrics["return_15"]
-                + 0.45 * metrics["return_30"]
+                0.20 * item["return_5"]
+                + 0.35 * item["return_15"]
+                + 0.45 * item["return_30"]
             )
 
-            alpha = (
-                0.50 * (
-                    metrics["return_15"]
-                    - spy["return_15"]
-                )
-                + 0.50 * (
-                    metrics["return_30"]
-                    - spy["return_30"]
-                )
-            )
-
-            metrics["alpha_15"] = (
-                metrics["return_15"]
+            alpha_15 = (
+                item["return_15"]
                 - spy["return_15"]
             )
 
-            metrics["alpha_30"] = (
-                metrics["return_30"]
+            alpha_30 = (
+                item["return_30"]
                 - spy["return_30"]
             )
 
-            metrics_by_symbol[symbol] = metrics
-            momentum_values[symbol] = momentum
-            volume_values[symbol] = metrics["relative_volume"]
-            alpha_values[symbol] = alpha
+            alpha = (
+                0.50 * alpha_15
+                + 0.50 * alpha_30
+            )
 
-        momentum_scores = self._percentile_scores(
-            momentum_values
-        )
-        volume_scores = self._percentile_scores(
-            volume_values
-        )
-        alpha_scores = self._percentile_scores(
-            alpha_values
+            item["alpha_15"] = alpha_15
+            item["alpha_30"] = alpha_30
+
+            metrics_by_symbol[symbol] = item
+            momentum_raw[symbol] = momentum
+            volume_raw[symbol] = (
+                item["relative_volume"]
+            )
+            alpha_raw[symbol] = alpha
+
+        momentum_scores = self.percentile_scores(
+            momentum_raw
         )
 
-        ranked = []
+        volume_scores = self.percentile_scores(
+            volume_raw
+        )
 
-        for symbol, metrics in metrics_by_symbol.items():
+        alpha_scores = self.percentile_scores(
+            alpha_raw
+        )
+
+        candidates = []
+
+        for symbol, item in metrics_by_symbol.items():
+            # OHLCV does not provide bid-ask spread;
+            # eligible liquid symbols receive a fixed score.
             liquidity_score = 100.0
 
-            score = (
-                0.35 * momentum_scores.get(symbol, 0)
-                + 0.25 * volume_scores.get(symbol, 0)
-                + 0.25 * alpha_scores.get(symbol, 0)
+            composite_score = (
+                0.35 * momentum_scores.get(
+                    symbol, 0
+                )
+                + 0.25 * volume_scores.get(
+                    symbol, 0
+                )
+                + 0.25 * alpha_scores.get(
+                    symbol, 0
+                )
                 + 0.15 * liquidity_score
             )
 
-            metrics["score"] = score
+            item["score"] = composite_score
 
-            eligible = (
-                score >= self.minimum_score
-                and metrics["relative_volume"]
+            qualifies = (
+                composite_score
+                >= self.minimum_score
+                and item["relative_volume"]
                 >= self.minimum_relative_volume
-                and metrics["return_5"] > 0
-                and metrics["return_15"] > 0
-                and metrics["return_30"] > 0
-                and metrics["alpha_15"] > 0
-                and metrics["alpha_30"] > 0
-                and metrics["price"] > metrics["vwap"]
-                and metrics["ema9"] > metrics["ema20"]
-                and metrics["price"] > metrics["open"]
+                and item["return_5"] > 0
+                and item["return_15"] > 0
+                and item["return_30"] > 0
+                and item["alpha_15"] >= 0
+                and item["alpha_30"] >= 0
+                and item["price"] > item["vwap"]
+                and item["ema9"] > item["ema20"]
+                and item["price"] > item["open"]
             )
 
-            if eligible:
-                ranked.append(metrics)
+            if qualifies:
+                candidates.append(item)
 
         return sorted(
-            ranked,
-            key=lambda item: item["score"],
+            candidates,
+            key=lambda candidate: candidate["score"],
             reverse=True
         )
 
-    def _rank_inverse_candidates(self, ohlcv):
-        ranked = []
-
-        for symbol in self.inverse_tickers:
-            metrics = self._metrics(ohlcv, symbol)
-
-            if metrics is None:
-                continue
-
-            score = 0.0
-
-            if metrics["price"] > metrics["vwap"]:
-                score += 25
-
-            if metrics["ema9"] > metrics["ema20"]:
-                score += 25
-
-            if metrics["return_15"] > 0:
-                score += 20
-
-            if metrics["return_30"] > 0:
-                score += 15
-
-            if metrics["relative_volume"] >= 1.20:
-                score += 15
-
-            metrics["score"] = score
-
-            if score >= 70:
-                ranked.append(metrics)
-
-        return sorted(
-            ranked,
-            key=lambda item: item["score"],
-            reverse=True
-        )
-
-    # ------------------------------------------------------------
-    # Range and volatility-reversal selection
-    # ------------------------------------------------------------
-
-    def _range_candidate(self, ohlcv):
+    def range_candidate(self, ohlcv):
         best = None
-        best_score = 0.0
+        best_score = None
 
-        for symbol in ["SPY", "QQQ", "IWM", "DIA"]:
-            metrics = self._metrics(ohlcv, symbol)
+        for symbol in [
+            "SPY", "QQQ", "IWM", "SMH"
+        ]:
+            item = self.metrics(ohlcv, symbol)
 
-            if metrics is None:
+            if item is None:
                 continue
 
-            distance_from_vwap = (
-                metrics["vwap"] - metrics["price"]
-            ) / metrics["price"]
+            distance_below_vwap = (
+                item["vwap"] - item["price"]
+            ) / item["price"]
 
-            reclaiming = (
-                metrics["price"] > metrics["open"]
-                and metrics["return_5"] > 0
+            bullish_reversal_bar = (
+                item["price"] > item["open"]
+                and item["return_5"] > 0
             )
+
+            qualifies = (
+                distance_below_vwap >= 0.0015
+                and bullish_reversal_bar
+                and item["relative_volume"] >= 0.80
+            )
+
+            if not qualifies:
+                continue
+
+            score = (
+                distance_below_vwap * 10000
+                + item["relative_volume"] * 10
+            )
+
+            item["score"] = score
 
             if (
-                distance_from_vwap >= 0.002
-                and reclaiming
-                and metrics["relative_volume"] >= 0.80
+                best_score is None
+                or score > best_score
             ):
-                score = (
-                    distance_from_vwap * 10000
-                    + metrics["relative_volume"] * 10
-                )
-
-                metrics["score"] = score
-
-                if score > best_score:
-                    best = metrics
-                    best_score = score
+                best = item
+                best_score = score
 
         return best
 
-    def _volatility_reversal_candidate(self, ohlcv):
-        candidates = self._rank_long_candidates(ohlcv)
+    def reversal_candidate(self, ohlcv):
+        ranked = self.rank_momentum_candidates(
+            ohlcv
+        )
 
-        for candidate in candidates:
+        for item in ranked:
             reclaimed_vwap = (
-                candidate["low"] < candidate["vwap"]
-                and candidate["price"] > candidate["vwap"]
+                item["low"] < item["vwap"]
+                and item["price"] > item["vwap"]
             )
 
             if reclaimed_vwap:
-                return candidate
+                return item
+
+        # If no stock qualifies, test SPY and QQQ.
+        for symbol in ["SPY", "QQQ"]:
+            item = self.metrics(ohlcv, symbol)
+
+            if item is None:
+                continue
+
+            if (
+                item["low"] < item["vwap"]
+                and item["price"] > item["vwap"]
+                and item["price"] > item["open"]
+            ):
+                return item
 
         return None
 
-    # ------------------------------------------------------------
-    # Position risk and lifecycle
-    # ------------------------------------------------------------
+    # ============================================================
+    # Entry and risk calculation
+    # ============================================================
 
-    def _calculate_entry(self, metrics, risk_fraction):
-        price = metrics["price"]
-        atr = metrics["atr"]
-        swing_low = metrics["swing_low"]
+    def calculate_setup(
+        self,
+        candidate,
+        risk_fraction
+    ):
+        entry = candidate["price"]
+        atr_value = candidate["atr"]
+        recent_swing_low = candidate["swing_low"]
 
-        if swing_low is None:
+        if recent_swing_low is None:
             return None
 
-        atr_stop = price - atr
-        structure_stop = swing_low - 0.10 * atr
+        atr_stop = entry - atr_value
+
+        structure_stop = (
+            recent_swing_low
+            - 0.10 * atr_value
+        )
 
         # Use the tighter valid stop.
-        stop = max(atr_stop, structure_stop)
+        stop = max(
+            atr_stop,
+            structure_stop
+        )
 
-        stop_distance = price - stop
+        risk_per_share = entry - stop
 
-        if stop_distance <= 0:
+        if risk_per_share <= 0:
             return None
 
-        stop_fraction = stop_distance / price
+        stop_fraction = (
+            risk_per_share / entry
+        )
 
+        # Avoid excessively tight or wide stops.
         if stop_fraction < 0.003:
             return None
 
         if stop_fraction > 0.02:
             return None
 
-        allocation = risk_fraction / stop_fraction
+        allocation = (
+            risk_fraction / stop_fraction
+        )
+
         allocation = min(
             allocation,
             self.maximum_allocation
@@ -667,43 +700,52 @@ class TradingStrategy(Strategy):
             return None
 
         return {
-            "entry": price,
+            "entry": entry,
             "stop": stop,
-            "risk": stop_distance,
-            "target": price + 3.0 * stop_distance,
+            "risk": risk_per_share,
+            "target": (
+                entry + 3.0 * risk_per_share
+            ),
             "allocation": allocation
         }
 
-    def _open_position(
+    def open_position(
         self,
-        symbol,
+        candidate,
         setup,
-        market_day,
-        timestamp
+        market_day
     ):
+        symbol = candidate["symbol"]
+
         self.active_symbol = symbol
+        self.active_allocation = (
+            setup["allocation"]
+        )
         self.entry_price = setup["entry"]
         self.initial_stop = setup["stop"]
         self.active_stop = setup["stop"]
         self.initial_risk = setup["risk"]
         self.profit_target = setup["target"]
         self.highest_price = setup["entry"]
-        self.entry_time = timestamp
-        self.entry_day = self.current_day
-        self.breakeven_activated = False
-        self.trailing_activated = False
-        self.below_vwap_count = 0
+        self.breakeven_active = False
+        self.trailing_active = False
+        self.below_vwap_bars = 0
 
         self.daily_entries += 1
+
         self.symbol_entries[symbol] = (
-            self.symbol_entries.get(symbol, 0) + 1
+            self.symbol_entries.get(symbol, 0)
+            + 1
         )
 
         log(
-            "ENTRY "
-            + symbol
-            + " day_type="
-            + market_day
+            "ENTRY"
+            + " symbol=" + symbol
+            + " regime=" + market_day
+            + " score="
+            + str(round(
+                candidate.get("score", 0), 2
+            ))
             + " entry="
             + str(round(self.entry_price, 4))
             + " stop="
@@ -711,19 +753,28 @@ class TradingStrategy(Strategy):
             + " target="
             + str(round(self.profit_target, 4))
             + " allocation="
-            + str(round(setup["allocation"], 4))
+            + str(round(
+                self.active_allocation, 4
+            ))
         )
 
         return TargetAllocation({
-            symbol: setup["allocation"]
+            symbol: self.active_allocation
         })
 
-    def _close_position(
+    # ============================================================
+    # Exit and position management
+    # ============================================================
+
+    def close_position(
         self,
         reason,
         exit_price,
         bar_number
     ):
+        symbol = self.active_symbol
+        realized_r = 0.0
+
         if (
             self.entry_price is not None
             and self.initial_risk is not None
@@ -733,86 +784,96 @@ class TradingStrategy(Strategy):
                 exit_price - self.entry_price
             ) / self.initial_risk
 
-            self.daily_realized_r += realized_r
+        self.daily_realized_r += realized_r
 
-            if realized_r < 0:
-                self.daily_losses += 1
+        if realized_r < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
 
-            log(
-                "EXIT "
-                + str(self.active_symbol)
-                + " reason="
-                + reason
-                + " price="
-                + str(round(exit_price, 4))
-                + " result_R="
-                + str(round(realized_r, 2))
+        if symbol is not None:
+            self.last_exit_bar[symbol] = (
+                bar_number
             )
 
-        if self.active_symbol is not None:
-            self.last_exit_bar[
-                self.active_symbol
-            ] = bar_number
+        log(
+            "EXIT"
+            + " symbol=" + str(symbol)
+            + " reason=" + reason
+            + " exit="
+            + str(round(exit_price, 4))
+            + " result_R="
+            + str(round(realized_r, 2))
+        )
 
         self.active_symbol = None
+        self.active_allocation = 0.0
         self.entry_price = None
         self.initial_stop = None
         self.active_stop = None
-        self.profit_target = None
         self.initial_risk = None
+        self.profit_target = None
         self.highest_price = None
-        self.entry_time = None
-        self.entry_day = None
-        self.breakeven_activated = False
-        self.trailing_activated = False
-        self.below_vwap_count = 0
+        self.breakeven_active = False
+        self.trailing_active = False
+        self.below_vwap_bars = 0
 
         return TargetAllocation({})
 
-    def _manage_position(
+    def manage_position(
         self,
         ohlcv,
         market_day,
         current_time,
         bar_number
     ):
-        metrics = self._metrics(
+        item = self.metrics(
             ohlcv,
             self.active_symbol
         )
 
-        if metrics is None:
+        if item is None:
+            log(
+                "Position data unavailable for "
+                + str(self.active_symbol)
+            )
+
+            # Maintain the current allocation rather
+            # than submitting an unverified trade.
             return TargetAllocation({
-                self.active_symbol: 0
+                self.active_symbol:
+                self.active_allocation
             })
 
-        price = metrics["price"]
-        bar_low = metrics["low"]
-        bar_high = metrics["high"]
+        price = item["price"]
+        bar_low = item["low"]
+        bar_high = item["high"]
 
         self.highest_price = max(
             self.highest_price,
             bar_high
         )
 
-        # Conservative same-bar rule:
-        # if both stop and target occur, assume stop happened first.
+        # Conservative same-bar handling:
+        # if both stop and target are touched,
+        # treat the protective stop as occurring first.
         if bar_low <= self.active_stop:
-            return self._close_position(
+            return self.close_position(
                 "PROTECTIVE_STOP",
                 self.active_stop,
                 bar_number
             )
 
         if bar_high >= self.profit_target:
-            return self._close_position(
-                "TARGET_3R",
+            return self.close_position(
+                "PROFIT_TARGET_3R",
                 self.profit_target,
                 bar_number
             )
 
         one_r_price = (
-            self.entry_price + self.initial_risk
+            self.entry_price
+            + self.initial_risk
         )
 
         two_r_price = (
@@ -820,171 +881,179 @@ class TradingStrategy(Strategy):
             + 2.0 * self.initial_risk
         )
 
-        # Move to breakeven after +1R.
+        # Move stop to breakeven after +1R.
         if bar_high >= one_r_price:
-            self.breakeven_activated = True
+            self.breakeven_active = True
+
             self.active_stop = max(
                 self.active_stop,
                 self.entry_price
             )
 
-        # Trail after +2R.
+        # Begin profit trailing after +2R.
         if bar_high >= two_r_price:
-            self.trailing_activated = True
+            self.trailing_active = True
 
-        if self.trailing_activated:
-            swing_low = metrics["swing_low"]
+        if self.trailing_active:
+            recent_swing_low = (
+                item["swing_low"]
+            )
 
-            if swing_low is not None:
-                ema_trail = (
-                    metrics["ema9"]
-                    - 0.25 * metrics["atr"]
+            if recent_swing_low is not None:
+                ema_trailing_stop = (
+                    item["ema9"]
+                    - 0.25 * item["atr"]
                 )
 
-                structure_trail = (
-                    swing_low
-                    - 0.10 * metrics["atr"]
+                structure_trailing_stop = (
+                    recent_swing_low
+                    - 0.10 * item["atr"]
                 )
 
-                new_stop = max(
-                    ema_trail,
-                    structure_trail
+                proposed_stop = max(
+                    ema_trailing_stop,
+                    structure_trailing_stop
                 )
 
-                # Stop can only move upward.
+                # A protective stop can move upward,
+                # but it can never move downward.
                 self.active_stop = max(
                     self.active_stop,
-                    new_stop
+                    proposed_stop
                 )
 
-        if price < metrics["vwap"]:
-            self.below_vwap_count += 1
+        if price < item["vwap"]:
+            self.below_vwap_bars += 1
         else:
-            self.below_vwap_count = 0
+            self.below_vwap_bars = 0
 
-        deterioration_count = 0
+        deterioration = 0
 
-        if self.below_vwap_count >= 2:
-            deterioration_count += 1
+        if self.below_vwap_bars >= 2:
+            deterioration += 1
 
-        if metrics["ema9"] < metrics["ema20"]:
-            deterioration_count += 1
+        if item["ema9"] < item["ema20"]:
+            deterioration += 1
 
-        if metrics["return_15"] < 0:
-            deterioration_count += 1
+        if item["return_15"] < 0:
+            deterioration += 1
 
-        if metrics["relative_volume"] < 0.80:
-            deterioration_count += 1
+        if item["relative_volume"] < 0.80:
+            deterioration += 1
 
-        if deterioration_count >= 2:
-            return self._close_position(
+        if deterioration >= 2:
+            return self.close_position(
                 "SIGNAL_DETERIORATION",
                 price,
                 bar_number
             )
 
-        # Exit when the new market regime conflicts with the position.
-        if (
-            market_day == "BEAR_TREND"
-            and self.active_symbol
-            not in self.inverse_tickers
-        ):
-            return self._close_position(
-                "MARKET_REGIME_CHANGE",
+        # Exit normal long positions when a bear
+        # market-day classification is confirmed.
+        if market_day == "BEAR_TREND":
+            return self.close_position(
+                "BEAR_REGIME",
                 price,
                 bar_number
             )
 
-        # Exit inverse ETFs when bear regime ends.
-        if (
-            self.active_symbol in self.inverse_tickers
-            and market_day != "BEAR_TREND"
-        ):
-            return self._close_position(
-                "BEAR_REGIME_ENDED",
+        # Mandatory end-of-day liquidation.
+        minutes = (
+            current_time.hour * 60
+            + current_time.minute
+        )
+
+        if minutes >= 15 * 60 + 50:
+            return self.close_position(
+                "END_OF_DAY",
                 price,
                 bar_number
-            )
-
-        # Same-day liquidation.
-        if current_time is not None:
-            minutes = (
-                current_time.hour * 60
-                + current_time.minute
-            )
-
-            if minutes >= 15 * 60 + 50:
-                return self._close_position(
-                    "END_OF_DAY",
-                    price,
-                    bar_number
-                )
-
-        # Preserve the current allocation.
-        stop_fraction = (
-            self.entry_price - self.initial_stop
-        ) / self.entry_price
-
-        if stop_fraction <= 0:
-            allocation = self.minimum_allocation
-        else:
-            allocation = min(
-                self.normal_risk_fraction
-                / stop_fraction,
-                self.maximum_allocation
             )
 
         return TargetAllocation({
-            self.active_symbol: allocation
+            self.active_symbol:
+            self.active_allocation
         })
 
-    # ------------------------------------------------------------
-    # Main Surmount execution method
-    # ------------------------------------------------------------
+    # ============================================================
+    # Main Surmount method
+    # ============================================================
 
     def run(self, data):
         ohlcv = data.get("ohlcv", [])
 
-        if not ohlcv or len(ohlcv) < 40:
+        if not ohlcv:
             return TargetAllocation({})
 
-        timestamp_value = self._timestamp(ohlcv)
-        current_time = self._parse_timestamp(
+        # At least 31 five-minute observations
+        # are required for the indicators.
+        if len(ohlcv) < 31:
+            return TargetAllocation({})
+
+        timestamp_value = self.current_timestamp(
+            ohlcv
+        )
+
+        current_time = self.parse_timestamp(
             timestamp_value
         )
-        bar_number = self._bar_number(ohlcv)
 
         if current_time is None:
             log(
-                "Unable to determine bar timestamp; "
-                "remaining in cash for safety"
+                "Timestamp unavailable; remaining in cash"
             )
             return TargetAllocation({})
 
         today = current_time.date().isoformat()
+        bar_number = len(ohlcv)
 
-        # Reset daily controls.
+        # Prevent overnight holdings.
+        if (
+            self.current_day is not None
+            and today != self.current_day
+            and self.active_symbol is not None
+        ):
+            item = self.metrics(
+                ohlcv,
+                self.active_symbol
+            )
+
+            exit_price = (
+                item["price"]
+                if item is not None
+                else self.entry_price
+            )
+
+            self.current_day = today
+
+            return self.close_position(
+                "NEW_DAY_SAFETY_EXIT",
+                exit_price,
+                bar_number
+            )
+
+        # Reset daily limits.
         if self.current_day != today:
             self.current_day = today
             self.daily_entries = 0
-            self.daily_losses = 0
+            self.consecutive_losses = 0
             self.daily_realized_r = 0.0
             self.symbol_entries = {}
 
-        market_day = self._classify_market_day(
-            ohlcv
+        market_day = (
+            self.classify_market_day(ohlcv)
         )
 
         log(
-            "MARKET_DAY "
-            + market_day
-            + " time="
-            + str(current_time)
+            "MARKET_DAY"
+            + " type=" + market_day
+            + " time=" + str(current_time)
         )
 
-        # Existing positions are managed before considering entries.
+        # Manage an existing position before
+        # considering any new entry.
         if self.active_symbol is not None:
-            return self._manage_position(
+            return self.manage_position(
                 ohlcv,
                 market_day,
                 current_time,
@@ -996,7 +1065,8 @@ class TradingStrategy(Strategy):
             + current_time.minute
         )
 
-        # Entry window: 9:45 AM through 3:00 PM.
+        # Entry period:
+        # 9:45 AM through 3:00 PM.
         if minutes < 9 * 60 + 45:
             return TargetAllocation({})
 
@@ -1004,74 +1074,77 @@ class TradingStrategy(Strategy):
             return TargetAllocation({})
 
         # Daily risk controls.
-        if self.daily_entries >= self.maximum_daily_entries:
+        if (
+            self.daily_entries
+            >= self.maximum_daily_entries
+        ):
             return TargetAllocation({})
 
-        if self.daily_losses >= 3:
+        if self.consecutive_losses >= 3:
             return TargetAllocation({})
 
+        # Approximately four full-risk losses.
         if self.daily_realized_r <= -4.0:
             return TargetAllocation({})
 
+        # Daily profit lock.
         if self.daily_realized_r >= 8.0:
             return TargetAllocation({})
 
-        if market_day == "NO_TRADE":
+        # Bear and no-trade days remain in cash
+        # in this reduced-universe version.
+        if market_day in [
+            "BEAR_TREND",
+            "NO_TRADE"
+        ]:
             return TargetAllocation({})
 
-        selected = None
-        risk_fraction = self.normal_risk_fraction
+        candidate = None
+        risk_fraction = (
+            self.normal_risk_fraction
+        )
 
-        # Bull-trend momentum/EMA strategy.
         if market_day == "BULL_TREND":
-            ranked = self._rank_long_candidates(
-                ohlcv
-            )
-
-            if ranked:
-                selected = ranked[0]
-
-        # Bear trend: inverse ETFs only.
-        elif market_day == "BEAR_TREND":
-            ranked = self._rank_inverse_candidates(
-                ohlcv
-            )
-
-            if ranked:
-                selected = ranked[0]
-
-        # Range day: VWAP mean-reversion candidate.
-        elif market_day == "RANGE":
-            selected = self._range_candidate(
-                ohlcv
-            )
-
-        # Volatility reversal: half-normal risk.
-        elif market_day == "VOLATILITY_REVERSAL":
-            selected = (
-                self._volatility_reversal_candidate(
+            candidates = (
+                self.rank_momentum_candidates(
                     ohlcv
                 )
+            )
+
+            if candidates:
+                candidate = candidates[0]
+
+        elif market_day == "RANGE":
+            candidate = self.range_candidate(
+                ohlcv
+            )
+
+        elif (
+            market_day
+            == "VOLATILITY_REVERSAL"
+        ):
+            candidate = (
+                self.reversal_candidate(ohlcv)
             )
 
             risk_fraction = (
                 self.reversal_risk_fraction
             )
 
-        if selected is None:
+        if candidate is None:
             return TargetAllocation({})
 
-        symbol = selected["symbol"]
+        symbol = candidate["symbol"]
 
-        # Maximum two entries per symbol daily.
         if (
             self.symbol_entries.get(symbol, 0)
             >= self.maximum_symbol_entries
         ):
             return TargetAllocation({})
 
-        # Thirty-minute symbol cooldown.
-        last_exit = self.last_exit_bar.get(symbol)
+        last_exit = self.last_exit_bar.get(
+            symbol
+        )
 
         if (
             last_exit is not None
@@ -1080,17 +1153,16 @@ class TradingStrategy(Strategy):
         ):
             return TargetAllocation({})
 
-        setup = self._calculate_entry(
-            selected,
+        setup = self.calculate_setup(
+            candidate,
             risk_fraction
         )
 
         if setup is None:
             return TargetAllocation({})
 
-        return self._open_position(
-            symbol,
+        return self.open_position(
+            candidate,
             setup,
-            market_day,
-            timestamp_value
+            market_day
         )
