@@ -1,1 +1,1 @@
-{"allocations": {"SPY": 25.0, "QQQ": 20.0, "TQQQ": 15.0, "SPXL": 12.0, "UPRO": 10.0, "IWM": 8.0, "XLF": 5.0, "XLE": 5.0}, "frequency": 1, "name": "", "period": "days"}
+{"allocations": {"SPY": 25.0, "QQQ": 20.0, "TQQQ": 15.0, "SPXL": 12.0, "UPRO": 10.0, "IWM": 8.0, "XLF": 5.0, "XLE": 5.0}, "frequency": 30, "name": "Diversified Growth Strategy", "period": "days"}
