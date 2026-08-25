@@ -10,7 +10,7 @@ class TradingStrategy(Strategy):
 
     @property
     def assets(self):
-        return ["SPY"]
+        return ["SPY", "QQQ"]
 
     @property
     def data(self):
@@ -20,7 +20,7 @@ class TradingStrategy(Strategy):
         ohlcv = data.get("ohlcv", [])
 
         log(
-            "SPY 5-MINUTE TEST: received "
+            "SPY/QQQ 5-MINUTE TEST: received "
             + str(len(ohlcv))
             + " bars"
         )
@@ -34,8 +34,20 @@ class TradingStrategy(Strategy):
             log("SPY missing from latest bar")
             return TargetAllocation({})
 
-        price = latest["SPY"].get("close")
+        if "QQQ" not in latest:
+            log("QQQ missing from latest bar")
+            return TargetAllocation({})
 
-        log("Latest SPY close: " + str(price))
+        spy_close = latest["SPY"].get("close")
+        qqq_close = latest["QQQ"].get("close")
 
-        return TargetAllocation({"SPY": 0.50})
+        log(
+            "SPY=" + str(spy_close)
+            + " QQQ=" + str(qqq_close)
+        )
+
+        # Diagnostic allocation only.
+        return TargetAllocation({
+            "SPY": 0.25,
+            "QQQ": 0.25
+        })
