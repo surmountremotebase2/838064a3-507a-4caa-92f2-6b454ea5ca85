@@ -6,7 +6,7 @@ class TradingStrategy(Strategy):
 
     @property
     def interval(self):
-        return "1day"
+        return "5min"
 
     @property
     def assets(self):
@@ -19,9 +19,23 @@ class TradingStrategy(Strategy):
     def run(self, data):
         ohlcv = data.get("ohlcv", [])
 
-        log("SPY TEST: received " + str(len(ohlcv)) + " bars")
+        log(
+            "SPY 5-MINUTE TEST: received "
+            + str(len(ohlcv))
+            + " bars"
+        )
 
         if not ohlcv:
             return TargetAllocation({})
+
+        latest = ohlcv[-1]
+
+        if "SPY" not in latest:
+            log("SPY missing from latest bar")
+            return TargetAllocation({})
+
+        price = latest["SPY"].get("close")
+
+        log("Latest SPY close: " + str(price))
 
         return TargetAllocation({"SPY": 0.50})
